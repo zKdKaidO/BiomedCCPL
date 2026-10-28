@@ -78,6 +78,16 @@ The tests in `tests/` run on CPU and need neither Dassl nor the datasets; they n
 .venv/bin/python -m pytest tests
 ```
 
+To run `train.py`, also install Dassl into the same environment. Its `setup.py` imports numpy, so build it without isolation, and skip its pinned linters (`--no-deps`), installing only what it imports at runtime:
+
+```bash
+git clone https://github.com/KaiyangZhou/Dassl.pytorch.git
+.venv/bin/pip install --no-deps --no-build-isolation -e Dassl.pytorch
+.venv/bin/pip install tabulate gdown "pandas<3" wilds==1.2.2
+```
+
+`Dassl.pytorch/` is git-ignored if you clone it inside the repo.
+
 `tests/test_vgap_modes.py` checks that `TRAINER.BIOMEDCCPL.VGAP.MODE text` (the default) reproduces the original model exactly, by comparing against `trainers/biomedccpl.py` as it was at commit `3257176` (see `docs/adr/0001-image-side-prototype-readout.md`).
 
 ## Data preparation
