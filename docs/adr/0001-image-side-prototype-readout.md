@@ -291,6 +291,7 @@ For R1/R2/R3, compute `t_causal` and `t_noncausal` **once** per evaluation (and 
 - Same optimizer, LR schedule, epochs, augmentations, $\tau$, prompt init, and SCD weights as the original config for each dataset.
 - **Batch size 1 for all accuracy runs**, so R0 and R2 differ only in architecture. Larger batches are evaluated only in the cost benchmark (§7.3).
 - Tuning budget, applied identically to R2 and R3, chosen on the few-shot **validation** split only, never on test: `READOUT_LR_MULT ∈ {1, 10}`, `READOUT_HEADS ∈ {original, 1}`. Report the chosen values. R0 uses the published config, no extra tuning.
+- `READOUT_LR_MULT` puts the readout in its own optimizer group. During the warmup epoch (`WARMUP_TYPE: constant`) every group runs at `WARMUP_CONS_LR`; the multiplier applies from the first cosine epoch on.
 - If $\beta$ stays below 0.05 for all of training on every dataset, the readout is unused; note it and retry with `READOUT_LR_MULT = 10` before concluding anything.
 
 ### 6.8 Tests (must pass before any experiment)

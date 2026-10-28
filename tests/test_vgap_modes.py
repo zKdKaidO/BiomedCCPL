@@ -418,3 +418,61 @@ def test_frozen_encoders_get_no_grad(request, biomedclip, fixture):
     for name, param in biomedclip.named_parameters():
         assert not param.requires_grad, name
         assert param.grad is None, name
+
+
+# READOUT_LR_MULT: the readout gets its own optimizer group (ADR 6.7).
+def test_param_groups_only_split_off_the_readout(models, r1_models, r2_models):
+    from trainers.biomedccpl import build_param_groups
+
+    assert build_param_groups(models[1], 0.0025, 10.0) is None  # R0: unchanged
+    assert build_param_groups(r1_models[1], 0.0025, 10.0) is None
+
+    model = r2_models[1]
+    others, readout = build_param_groups(model, 0.0025, 10.0)
+    assert "lr" not in others and readout["lr"] == pytest.approx(0.025)
+    readout_ids = {id(p) for p in model.image_readout.parameters()}
+    assert {id(p) for p in readout["params"]} == readout_ids
+    assert {id(p) for p in others["params"]} == {
+        id(model.ctx_causal), id(model.ctx_non_causal)
+    }
+
+
+def test_readout_lr_mult_through_dassl_schedule(r2_models):
+    dassl_config = pytest.importorskip("dassl.config")
+    from dassl.optim import build_lr_scheduler, build_optimizer
+    from trainers.biomedccpl import build_param_groups
+
+    model = r2_models[1]
+    cfg = dassl_config.get_cfg_default()
+    cfg.OPTIM.NAME = "sgd"
+    cfg.OPTIM.LR = 0.0025
+    cfg.OPTIM.MAX_EPOCH = 50
+    cfg.OPTIM.LR_SCHEDULER = "cosine"
+    cfg.OPTIM.WARMUP_EPOCH = 1
+    cfg.OPTIM.WARMUP_TYPE = "constant"
+    cfg.OPTIM.WARMUP_CONS_LR = 1e-5
+    groups = build_param_groups(model, cfg.OPTIM.LR, 10.0)
+    optimizer = build_optimizer(model, cfg.OPTIM, param_groups=groups)
+    scheduler = build_lr_scheduler(optimizer, cfg.OPTIM)
+
+    # Warmup epoch: every group at WARMUP_CONS_LR; afterwards the cosine
+    # schedule keeps the readout at 10x the prompt learning rate.
+    assert [g["lr"] for g in optimizer.param_groups] == [1e-5, 1e-5]
+    scheduler.step()
+    base_lr, readout_lr = (g["lr"] for g in optimizer.param_groups)
+    assert readout_lr == pytest.approx(10 * base_lr)
+    assert base_lr == pytest.approx(0.0025, rel=1e-2)
+
+
+def test_key_mismatch_warning(capsys):
+    from torch.nn.modules.module import _IncompatibleKeys
+    from trainers.biomedccpl import warn_on_key_mismatch
+
+    warn_on_key_mismatch(_IncompatibleKeys([], []), "ckpt")
+    assert capsys.readouterr().out == ""
+
+    missing = [f"image_readout.p{i}" for i in range(7)]
+    warn_on_key_mismatch(_IncompatibleKeys(missing, ["prototype_learner.0"]), "ckpt")
+    out = capsys.readouterr().out
+    assert "7 missing key(s)" in out and "(+2 more)" in out
+    assert "1 unexpected key(s)" in out

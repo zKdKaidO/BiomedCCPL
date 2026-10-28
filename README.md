@@ -122,7 +122,7 @@ The script trains and evaluates seeds 1, 2, and 3, then reports their mean and s
 bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0
 ```
 
-Arguments are `DATA_ROOT`, `DATASET`, `SHOTS`, and optional `GPU_ID`. Valid shot counts are 1, 2, 4, 8, and 16.
+Arguments are `DATA_ROOT`, `DATASET`, `SHOTS`, and optional `GPU_ID`. Valid shot counts are 1, 2, 4, 8, and 16. Results go to `output/few_shot/text/<DATASET>/<SHOTS>shot/seed<N>`; see [ADR-0001 variants](#adr-0001-variants) for the other model variants.
 
 ### Base-to-novel generalization
 
@@ -131,6 +131,22 @@ bash scripts/run_base_to_novel.sh /path/to/data BTMRI 0
 ```
 
 This trains on the base classes with 16 shots per class and evaluates the same checkpoint on novel classes for three seeds. Following the paper, BUSI is excluded because it has only three classes.
+
+### ADR-0001 variants
+
+[ADR-0001](docs/adr/0001-image-side-prototype-readout.md) compares the original model with variants selected by `TRAINER.BIOMEDCCPL.VGAP.MODE`. Both scripts take the mode from `VGAP_MODE` (default `text`), write to `output/<protocol>/<RUN_TAG>/...` (`RUN_TAG` defaults to the mode), and pass any arguments after `GPU_ID` to `train.py` as config overrides:
+
+```bash
+bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0                     # R0: original BiomedCCPL
+VGAP_MODE=none bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0      # R1: no VGAP
+VGAP_MODE=image bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0     # R2: image-side readout
+VGAP_MODE=image RUN_TAG=r3 bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0 \
+  TRAINER.BIOMEDCCPL.VGAP.IMAGE_LAYERS "[3, 7, 11]"                       # R3
+VGAP_MODE=image RUN_TAG=r2_lr10 bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0 \
+  TRAINER.BIOMEDCCPL.VGAP.READOUT_LR_MULT 10.0                            # R2, readout at 10x LR
+```
+
+Set a distinct `RUN_TAG` whenever two runs share a mode, or the second overwrites the first. `run_base_to_novel.sh` works the same way and applies the mode and overrides to both the base training and the novel evaluation.
 
 ### Single run
 
@@ -160,13 +176,15 @@ python train.py \
   --root /path/to/data \
   --output-dir output/eval \
   --config-file configs/trainers/BiomedCCPL/base_to_novel/BTMRI.yaml \
-  --model-dir output/base_to_novel/BTMRI/base/seed1 \
+  --model-dir output/base_to_novel/text/BTMRI/base/seed1 \
   --load-epoch 50 \
   --eval-only \
   DATASET.NAME BTMRI \
   DATASET.NUM_SHOTS 16 \
   DATASET.SUBSAMPLE_CLASSES new
 ```
+
+Evaluate with the same `TRAINER.BIOMEDCCPL.VGAP.MODE` the checkpoint was trained with; loading prints a warning if the checkpoint's keys do not match the model.
 
 ## Citation
 

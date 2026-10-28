@@ -36,6 +36,42 @@ def count_trainable_params(model):
     return counts
 
 
+def build_param_groups(model, base_lr, readout_lr_mult):
+    """Optimizer param groups; the image readout trains at base_lr * READOUT_LR_MULT.
+
+    Returns None outside VGAP.MODE "image", so Dassl optimizes
+    model.parameters() exactly as the original trainer did.
+    """
+    readout = getattr(model, "image_readout", None)
+    if readout is None:
+        return None
+    readout_params = [p for p in readout.parameters() if p.requires_grad]
+    readout_ids = {id(p) for p in readout_params}
+    other_params = [
+        p for p in model.parameters() if p.requires_grad and id(p) not in readout_ids
+    ]
+    return [
+        {"params": other_params},
+        {"params": readout_params, "lr": base_lr * readout_lr_mult},
+    ]
+
+
+def warn_on_key_mismatch(load_result, model_path, max_names=5):
+    """load_state_dict(strict=False) is silent; a checkpoint from another
+    VGAP.MODE would otherwise load with its trained modules missing."""
+    for kind, keys in (
+        ("missing", load_result.missing_keys),
+        ("unexpected", load_result.unexpected_keys),
+    ):
+        if keys:
+            shown = ", ".join(keys[:max_names])
+            more = f" (+{len(keys) - max_names} more)" if len(keys) > max_names else ""
+            print(
+                f"WARNING: {len(keys)} {kind} key(s) when loading '{model_path}': "
+                f"{shown}{more}. Was it trained with a different VGAP.MODE?"
+            )
+
+
 class LayerNorm(nn.LayerNorm):
     """Compute LayerNorm in fp32 for stable mixed-precision training."""
 
@@ -597,7 +633,12 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
         )
 
         self.model.to(self.device)
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        param_groups = build_param_groups(
+            self.model,
+            cfg.OPTIM.LR,
+            cfg.TRAINER.BIOMEDCCPL.VGAP.READOUT_LR_MULT,
+        )
+        self.optim = build_optimizer(self.model, cfg.OPTIM, param_groups=param_groups)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("causal_model", self.model, self.optim, self.sched)
         self.scaler = GradScaler() if cfg.TRAINER.BIOMEDCCPL.PREC == "amp" else None
@@ -667,4 +708,5 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
             epoch = checkpoint["epoch"]
             print(f"Loading weights to {name} from '{model_path}' (epoch = {epoch})")
 
-            self._models[name].load_state_dict(state_dict, strict=False)
+            result = self._models[name].load_state_dict(state_dict, strict=False)
+            warn_on_key_mismatch(result, model_path)

@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 DATA_ROOT DATASET [GPU_ID]" >&2
+# VGAP_MODE selects the ADR-0001 variant (text = original BiomedCCPL, none, image).
+# RUN_TAG names the output folder; set it when two runs share a mode (e.g. R2 vs R3).
+# Extra arguments after GPU_ID are passed to train.py as config overrides, for
+# both the base training run and the novel evaluation.
+if [[ $# -lt 2 ]]; then
+  echo "Usage: [VGAP_MODE=text|none|image] [RUN_TAG=name] $0 DATA_ROOT DATASET [GPU_ID [KEY VALUE ...]]" >&2
   exit 2
 fi
 
 DATA_ROOT=$1
 DATASET=$2
 GPU_ID=${3:-0}
+shift $(( $# < 3 ? $# : 3 ))
+VGAP_MODE=${VGAP_MODE:-text}
+RUN_TAG=${RUN_TAG:-${VGAP_MODE}}
 CONFIG="configs/trainers/BiomedCCPL/base_to_novel/${DATASET}.yaml"
 
 if [[ "${DATASET}" == "BUSI" ]]; then
@@ -20,9 +27,10 @@ if [[ ! -f "${CONFIG}" ]]; then
   exit 2
 fi
 
+ROOT_OUTPUT="output/base_to_novel/${RUN_TAG}/${DATASET}"
 for SEED in 1 2 3; do
-  BASE_OUTPUT="output/base_to_novel/${DATASET}/base/seed${SEED}"
-  NOVEL_OUTPUT="output/base_to_novel/${DATASET}/novel/seed${SEED}"
+  BASE_OUTPUT="${ROOT_OUTPUT}/base/seed${SEED}"
+  NOVEL_OUTPUT="${ROOT_OUTPUT}/novel/seed${SEED}"
 
   CUDA_VISIBLE_DEVICES=${GPU_ID} python train.py \
     --root "${DATA_ROOT}" \
@@ -31,7 +39,9 @@ for SEED in 1 2 3; do
     --config-file "${CONFIG}" \
     DATASET.NAME "${DATASET}" \
     DATASET.NUM_SHOTS 16 \
-    DATASET.SUBSAMPLE_CLASSES base
+    DATASET.SUBSAMPLE_CLASSES base \
+    TRAINER.BIOMEDCCPL.VGAP.MODE "${VGAP_MODE}" \
+    ${@+"$@"}
 
   CUDA_VISIBLE_DEVICES=${GPU_ID} python train.py \
     --root "${DATA_ROOT}" \
@@ -43,8 +53,10 @@ for SEED in 1 2 3; do
     --eval-only \
     DATASET.NAME "${DATASET}" \
     DATASET.NUM_SHOTS 16 \
-    DATASET.SUBSAMPLE_CLASSES new
+    DATASET.SUBSAMPLE_CLASSES new \
+    TRAINER.BIOMEDCCPL.VGAP.MODE "${VGAP_MODE}" \
+    ${@+"$@"}
 done
 
-python tools/parse_test_res.py "output/base_to_novel/${DATASET}/base"
-python tools/parse_test_res.py "output/base_to_novel/${DATASET}/novel"
+python tools/parse_test_res.py "${ROOT_OUTPUT}/base"
+python tools/parse_test_res.py "${ROOT_OUTPUT}/novel"
