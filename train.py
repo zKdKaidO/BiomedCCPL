@@ -6,24 +6,18 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
-from yacs.config import CfgNode as CN
 
 import datasets  # noqa: F401 - registers the supported datasets
 import trainers  # noqa: F401 - registers the BiomedCCPL trainer
 from dassl.config import get_cfg_default
 from dassl.engine import build_trainer
 from dassl.utils import collect_env_info, set_random_seed, setup_logger
+from trainers.config import add_biomedccpl_cfg
 
 
 def extend_cfg(cfg):
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"
-    cfg.TRAINER.BIOMEDCCPL = CN()
-    cfg.TRAINER.BIOMEDCCPL.PREC = "fp32"
-    cfg.TRAINER.BIOMEDCCPL.ALPHA = 1.0
-    cfg.TRAINER.BIOMEDCCPL.PROTONUM = 14
-    cfg.TRAINER.BIOMEDCCPL.LAMBDA_NEM = 0.1
-    cfg.TRAINER.BIOMEDCCPL.LAMBDA_ORTHO = 0.01
-    cfg.TRAINER.BIOMEDCCPL.CROSSLAYERS = [3, 7, 11]
+    add_biomedccpl_cfg(cfg)
 
 
 def setup_cfg(args):

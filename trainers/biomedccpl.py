@@ -12,8 +12,17 @@ from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.utils import load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.metrics import compute_accuracy
+from trainers.config import VGAP_MODES
 from trainers.prompt_templates import CUSTOM_TEMPLATES
 from open_clip import create_model_from_pretrained, get_tokenizer
+
+# Substrings of the parameter names that are trained; everything else is frozen.
+TRAINABLE_PARAM_NAMES = [
+    "ctx_causal",
+    "ctx_non_causal",
+    "prototype_learner",
+    "crossattention_layer",
+]
 
 
 class LayerNorm(nn.LayerNorm):
@@ -42,6 +51,17 @@ class CustomCLIP(nn.Module):
         self.lambda_nem = cfg.TRAINER.BIOMEDCCPL.get("LAMBDA_NEM", 0.1)
         self.lambda_ortho = cfg.TRAINER.BIOMEDCCPL.get("LAMBDA_ORTHO", 0.01)
         self.crosslayers = cfg.TRAINER.BIOMEDCCPL.get("CROSSLAYERS", [3, 7, 11])
+
+        vgap_cfg = cfg.TRAINER.BIOMEDCCPL.get("VGAP", {})
+        self.vgap_mode = vgap_cfg.get("MODE", "text")
+        if self.vgap_mode not in VGAP_MODES:
+            raise ValueError(
+                f"VGAP.MODE must be one of {VGAP_MODES}, got {self.vgap_mode!r}"
+            )
+        if self.vgap_mode != "text":
+            raise NotImplementedError(
+                f"VGAP.MODE {self.vgap_mode!r} is not implemented yet (ADR-0001)"
+            )
 
         clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
@@ -117,6 +137,12 @@ class CustomCLIP(nn.Module):
         )
 
     def forward(self, image, label=None):
+        if self.vgap_mode == "text":
+            return self._forward_text_vgap(image, label)
+        raise NotImplementedError(f"VGAP.MODE {self.vgap_mode!r}")
+
+    def _forward_text_vgap(self, image, label=None):
+        """Original BiomedCCPL forward: VGAP injected into both text branches."""
         logit_scale = self.logit_scale.exp()
         batch_size = image.shape[0]
 
@@ -339,15 +365,9 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
         self.model = CustomCLIP(cfg, classnames, biomedclip_model)
 
         print("Turning off gradients in both the image and the text encoder")
-        names_to_update = [
-            "ctx_causal",
-            "ctx_non_causal",
-            "prototype_learner",
-            "crossattention_layer",
-        ]
         for name, param in self.model.named_parameters():
             param.requires_grad = False
-            if any(re_name in name for re_name in names_to_update):
+            if any(re_name in name for re_name in TRAINABLE_PARAM_NAMES):
                 param.requires_grad_(True)
         enabled = {
             name for name, param in self.model.named_parameters() if param.requires_grad

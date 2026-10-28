@@ -67,6 +67,19 @@ cd ..
 
 The first run downloads `microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224` from Hugging Face. Set `HF_ENDPOINT` yourself if a mirror is required.
 
+### Local development and tests (macOS, CPU)
+
+The tests in `tests/` run on CPU and need neither Dassl nor the datasets; they need the BiomedCLIP weights (downloaded on first use). Tested on an Apple M2 with Homebrew Python 3.12 (`numpy<2` has no wheels for Python 3.13):
+
+```bash
+/opt/homebrew/bin/python3.12 -m venv .venv
+.venv/bin/pip install torch==2.5.1 torchvision==0.20.1
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests
+```
+
+`tests/test_vgap_modes.py` checks that `TRAINER.BIOMEDCCPL.VGAP.MODE text` (the default) reproduces the original model exactly, by comparing against `trainers/biomedccpl.py` as it was at commit `3257176` (see `docs/adr/0001-image-side-prototype-readout.md`).
+
 ## Data preparation
 
 Please follow the official BiomedCoOp [DATASETS.md](https://github.com/HealthX-Lab/BiomedCoOp/blob/main/assets/DATASETS.md) to download, extract, and organize the datasets. BiomedCCPL uses the same 11 biomedical classification datasets and data splits. After completing those instructions, the dataset root passed to `--root` should contain:
