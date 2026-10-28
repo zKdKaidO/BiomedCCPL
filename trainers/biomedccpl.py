@@ -22,7 +22,18 @@ TRAINABLE_PARAM_NAMES = [
     "ctx_non_causal",
     "prototype_learner",
     "crossattention_layer",
+    "image_readout",
 ]
+
+
+def count_trainable_params(model):
+    """Trainable parameters per top-level submodule (ADR-0001 test 6.8.7)."""
+    counts = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            top = name.split(".")[0]
+            counts[top] = counts.get(top, 0) + param.numel()
+    return counts
 
 
 class LayerNorm(nn.LayerNorm):
@@ -32,6 +43,96 @@ class LayerNorm(nn.LayerNorm):
         orig_type = x.dtype
         ret = super().forward(x.type(torch.float32))
         return ret.type(orig_type)
+
+
+def build_prototype_learner(width, protonum):
+    # B, 196, width -> B, 196, protonum
+    return nn.Sequential(
+        nn.Linear(width, 256, bias=False),
+        LayerNorm(256),
+        nn.ReLU(inplace=True),
+        nn.Linear(256, protonum, bias=False),
+    )
+
+
+def compute_prototypes(prototype_learner, patches):
+    """VGAP prototypes: softmax over patches, then a weighted sum of patches."""
+    w_score = prototype_learner(patches)
+    w_score_softmax = F.softmax(w_score, dim=1)
+    # B, protonum, 196 @ B, 196, width -> B, protonum, width
+    return torch.matmul(w_score_softmax.transpose(1, 2), patches)
+
+
+class ImageSideReadout(nn.Module):
+    """Class-agnostic prototype readout on the image side (ADR-0001, R2/R3).
+
+    F_I' = norm(F_I + tanh(g) * W_o CrossAttn(q = [CLS], K = V = prototypes)).
+    With g = 0 at init the model starts out identical to VGAP.MODE "none".
+    """
+
+    def __init__(
+        self,
+        layers,
+        width=768,
+        embed_dim=512,
+        protonum=14,
+        heads=12,
+        dropout=0.0,
+        gate_init=0.0,
+    ):
+        super().__init__()
+        self.layers = sorted(layers)
+        # One prototype learner per layer, defined exactly as in VGAP.
+        self.proto = nn.ModuleDict(
+            {str(layer): build_prototype_learner(width, protonum) for layer in self.layers}
+        )
+        # Tells the prototypes of different layers apart (R3 only).
+        self.layer_emb = (
+            nn.Parameter(torch.zeros(len(self.layers), 1, width))
+            if len(self.layers) > 1
+            else None
+        )
+        self.ln_q = LayerNorm(width)
+        self.ln_kv = LayerNorm(width)
+        self.attn = nn.MultiheadAttention(
+            width, heads, dropout=dropout, batch_first=True
+        )
+        self.W_o = nn.Linear(width, embed_dim, bias=False)
+        self.g = nn.Parameter(torch.tensor(float(gate_init)))  # beta = tanh(g)
+
+    def prototypes(self, hidden):
+        prototypes = []
+        for i, layer in enumerate(self.layers):
+            prototype = compute_prototypes(self.proto[str(layer)], hidden[layer])
+            if self.layer_emb is not None:
+                prototype = prototype + self.layer_emb[i]
+            prototypes.append(prototype)
+        return torch.cat(prototypes, dim=1)  # B, protonum * len(layers), width
+
+    def forward(self, hidden, cls_token, image_features):
+        """
+        hidden: {layer: (B, 196, width)} patch tokens; cls_token: (B, width)
+        [CLS] state of the deepest layer; image_features: (B, embed_dim),
+        projected but not normalized. Returns normalized (B, embed_dim) features.
+        """
+        kv = self.ln_kv(self.prototypes(hidden))
+        query = self.ln_q(cls_token).unsqueeze(1)  # B, 1, width
+        readout, attn_weights = self.attn(query, kv, kv, need_weights=True)
+        readout = self.W_o(readout.squeeze(1))  # B, embed_dim
+
+        beta = torch.tanh(self.g)
+        features = F.normalize(image_features + beta * readout, dim=-1)
+
+        with torch.no_grad():
+            attn = attn_weights.squeeze(1)  # B, protonum * len(layers)
+            logs = {
+                "beta": beta.detach(),
+                "r_norm_ratio": (
+                    readout.norm(dim=-1) / image_features.norm(dim=-1)
+                ).mean(),
+                "attn_entropy": -(attn * attn.clamp_min(1e-12).log()).sum(-1).mean(),
+            }
+        return features, logs
 
 
 class CustomCLIP(nn.Module):
@@ -58,10 +159,22 @@ class CustomCLIP(nn.Module):
             raise ValueError(
                 f"VGAP.MODE must be one of {VGAP_MODES}, got {self.vgap_mode!r}"
             )
-        if self.vgap_mode not in ("text", "none"):
+        if self.vgap_mode == "text_agnostic":
             raise NotImplementedError(
                 f"VGAP.MODE {self.vgap_mode!r} is not implemented yet (ADR-0001)"
             )
+        self.image_layers = sorted(vgap_cfg.get("IMAGE_LAYERS", [11]))
+        n_blocks = len(biomedclip_model.visual.trunk.blocks)
+        if self.vgap_mode == "image" and (
+            not self.image_layers
+            or not all(0 <= layer < n_blocks for layer in self.image_layers)
+        ):
+            raise ValueError(
+                f"VGAP.IMAGE_LAYERS must be ViT block indices in [0, {n_blocks}), "
+                f"got {self.image_layers}"
+            )
+        # Detached diagnostics from the last forward pass, logged by the trainer.
+        self.logs = {}
 
         clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
@@ -111,15 +224,19 @@ class CustomCLIP(nn.Module):
         # starts from the same prompt initialization for a given seed.
         if self.vgap_mode == "text":
             self._build_text_vgap()
+        elif self.vgap_mode == "image":
+            self.image_readout = ImageSideReadout(
+                self.image_layers,
+                width=biomedclip_model.visual.trunk.embed_dim,
+                embed_dim=biomedclip_model.visual.head.proj.out_features,
+                protonum=self.protonum,
+                heads=vgap_cfg.get("READOUT_HEADS", 12),
+                dropout=vgap_cfg.get("READOUT_DROPOUT", 0.0),
+                gate_init=vgap_cfg.get("GATE_INIT", 0.0),
+            )
 
     def _build_text_vgap(self):
-        # B, 196, 768 -> B, 196, 14
-        single_prototype_learner = nn.Sequential(
-            nn.Linear(768, 256, bias=False),
-            LayerNorm(256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, self.protonum, bias=False),
-        )
+        single_prototype_learner = build_prototype_learner(768, self.protonum)
         self.prototype_learner = nn.ModuleList(
             [
                 copy.deepcopy(single_prototype_learner)
@@ -143,6 +260,7 @@ class CustomCLIP(nn.Module):
         )
 
     def forward(self, image, label=None):
+        self.logs = {}
         if self.vgap_mode == "text":
             return self._forward_text_vgap(image, label)
         return self._forward_decoupled(image, label)
@@ -205,11 +323,8 @@ class CustomCLIP(nn.Module):
                 )
             image_emb = self.biomedclip_model.visual.trunk.blocks[i](image_emb)
             if i in self.crosslayers:
-                w_score = self.prototype_learner[counter](image_emb[:, 1:, :])
-                w_score_softmax = F.softmax(w_score, dim=1)
-                # B, 14, 196 @ B, 196, 768 -> B, 14, 768
-                prototype = torch.matmul(
-                    w_score_softmax.transpose(1, 2), image_emb[:, 1:, :]
+                prototype = compute_prototypes(
+                    self.prototype_learner[counter], image_emb[:, 1:, :]
                 )
 
                 text_emb_causal_batch = text_emb_causal.reshape(
@@ -275,11 +390,26 @@ class CustomCLIP(nn.Module):
             return logits
 
     def _forward_decoupled(self, image, label=None):
-        """VGAP.MODE "none" (R1): text features no longer depend on the image."""
+        """VGAP.MODE "none" (R1) and "image" (R2/R3).
+
+        Text features no longer depend on the image; in MODE "image" a single
+        class-agnostic readout of the prototypes updates the image feature.
+        """
         logit_scale = self.logit_scale.exp()
 
-        _, _, image_features = self._encode_image_keep(image)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        readout = self.vgap_mode == "image"
+        hidden, cls_token, image_features = self._encode_image_keep(
+            image, self.image_layers if readout else ()
+        )
+        if readout:
+            image_features, readout_logs = self.image_readout(
+                hidden, cls_token, image_features
+            )
+            self.logs.update(readout_logs)
+        else:
+            image_features = image_features / image_features.norm(
+                dim=-1, keepdim=True
+            )
 
         cau_text_feature = self._encode_text(self.ctx_causal)  # (ncls, D)
         logits = logit_scale * self._class_scores(image_features, cau_text_feature)
@@ -321,6 +451,8 @@ class CustomCLIP(nn.Module):
             + self.lambda_nem * loss_nem
             + loss_sar
         )
+        with torch.no_grad():
+            self.logs["loss_sar_cos"] = self._compute_sar_cos(cau_text_feature)
         return logits, total_loss, loss_ce, loss_ortho, loss_nem, loss_sar
 
     @staticmethod
@@ -417,6 +549,14 @@ class CustomCLIP(nn.Module):
             target = target.unsqueeze(0).expand_as(text_features)
         return F.mse_loss(text_features, target)
 
+    def _compute_sar_cos(self, text_features):
+        # The paper's form, 1 - mean cosine to the anchors. For unit vectors the
+        # element-wise MSE above equals (2 / D) times this (ADR-0001, 1.1 item 5).
+        target = self.hand_feas
+        if text_features.dim() == 3:
+            target = target.unsqueeze(0).expand_as(text_features)
+        return 1.0 - (text_features * target).sum(dim=-1).mean()
+
 
 @TRAINER_REGISTRY.register()
 class BIOMEDCCPL_BiomedCLIP(TrainerX):
@@ -450,6 +590,11 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
         }
         print(f"Parameters to be updated: {enabled}")
         print(f"Parameters count: {len(enabled)}")
+        param_counts = count_trainable_params(self.model)
+        print(
+            f"Trainable parameters (VGAP.MODE {self.model.vgap_mode!r}): "
+            f"{sum(param_counts.values()):,} {param_counts}"
+        )
 
         self.model.to(self.device)
         self.optim = build_optimizer(self.model, cfg.OPTIM)
@@ -487,6 +632,7 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
             "loss_sar": loss_sar.item(),
             "acc": compute_accuracy(logits, label)[0].item(),
         }
+        loss_summary.update({name: value.item() for name, value in model.logs.items()})
 
         # Step the epoch-level learning-rate scheduler after the final batch.
         if (self.batch_idx + 1) == self.num_batches:
