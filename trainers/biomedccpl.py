@@ -58,7 +58,7 @@ class CustomCLIP(nn.Module):
             raise ValueError(
                 f"VGAP.MODE must be one of {VGAP_MODES}, got {self.vgap_mode!r}"
             )
-        if self.vgap_mode != "text":
+        if self.vgap_mode not in ("text", "none"):
             raise NotImplementedError(
                 f"VGAP.MODE {self.vgap_mode!r} is not implemented yet (ADR-0001)"
             )
@@ -107,6 +107,12 @@ class CustomCLIP(nn.Module):
         noise = torch.randn_like(ctx_vectors) * 0.01
         self.ctx_non_causal = nn.Parameter(ctx_vectors.clone() + noise)
 
+        # Text-side VGAP modules; built after the prompts so that every MODE
+        # starts from the same prompt initialization for a given seed.
+        if self.vgap_mode == "text":
+            self._build_text_vgap()
+
+    def _build_text_vgap(self):
         # B, 196, 768 -> B, 196, 14
         single_prototype_learner = nn.Sequential(
             nn.Linear(768, 256, bias=False),
@@ -139,7 +145,7 @@ class CustomCLIP(nn.Module):
     def forward(self, image, label=None):
         if self.vgap_mode == "text":
             return self._forward_text_vgap(image, label)
-        raise NotImplementedError(f"VGAP.MODE {self.vgap_mode!r}")
+        return self._forward_decoupled(image, label)
 
     def _forward_text_vgap(self, image, label=None):
         """Original BiomedCCPL forward: VGAP injected into both text branches."""
@@ -259,37 +265,106 @@ class CustomCLIP(nn.Module):
         )
 
         if self.training:
-            loss_ce = F.cross_entropy(logits, label)
-            loss_sar = self._compute_sar_loss(cau_text_feature)
-
             adv_text_features = self._get_final_text_features(
                 text_emb_non_causal
             ).reshape(batch_size, self.n_cls, -1)
-
-            ortho_matrix = torch.matmul(
-                F.normalize(cau_text_feature, dim=-1),
-                F.normalize(adv_text_features, dim=-1).transpose(1, 2),
+            return self._compute_losses(
+                logits, label, image_features, cau_text_feature, adv_text_features
             )
-            loss_ortho = torch.mean(ortho_matrix**2)
-
-            logits_adv = logit_scale * torch.einsum(
-                "bd,bcd->bc", image_features, adv_text_features
-            )
-            log_probs_adv = F.log_softmax(logits_adv, dim=-1)
-            uniform_dist = torch.full_like(log_probs_adv, 1.0 / self.n_cls)
-            loss_nem = F.kl_div(
-                log_probs_adv, uniform_dist, reduction="batchmean"
-            )  # Make the non-causal pathway non-predictive.
-
-            total_loss = (
-                loss_ce
-                + self.lambda_ortho * loss_ortho
-                + self.lambda_nem * loss_nem
-                + loss_sar
-            )
-            return logits, total_loss, loss_ce, loss_ortho, loss_nem, loss_sar
         else:
             return logits
+
+    def _forward_decoupled(self, image, label=None):
+        """VGAP.MODE "none" (R1): text features no longer depend on the image."""
+        logit_scale = self.logit_scale.exp()
+
+        _, _, image_features = self._encode_image_keep(image)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        cau_text_feature = self._encode_text(self.ctx_causal)  # (ncls, D)
+        logits = logit_scale * self._class_scores(image_features, cau_text_feature)
+
+        if self.training:
+            adv_text_features = self._encode_text(self.ctx_non_causal)
+            return self._compute_losses(
+                logits, label, image_features, cau_text_feature, adv_text_features
+            )
+        else:
+            return logits
+
+    def _compute_losses(
+        self, logits, label, image_features, cau_text_feature, adv_text_features
+    ):
+        # Keep the original operation order: MODE "text" must stay bit-identical,
+        # and autograd's accumulation order depends on it.
+        loss_ce = F.cross_entropy(logits, label)
+        loss_sar = self._compute_sar_loss(cau_text_feature)
+
+        ortho_matrix = torch.matmul(
+            F.normalize(cau_text_feature, dim=-1),
+            F.normalize(adv_text_features, dim=-1).transpose(-2, -1),
+        )
+        loss_ortho = torch.mean(ortho_matrix**2)
+
+        logits_adv = self.logit_scale.exp() * self._class_scores(
+            image_features, adv_text_features
+        )
+        log_probs_adv = F.log_softmax(logits_adv, dim=-1)
+        uniform_dist = torch.full_like(log_probs_adv, 1.0 / self.n_cls)
+        loss_nem = F.kl_div(
+            log_probs_adv, uniform_dist, reduction="batchmean"
+        )  # Make the non-causal pathway non-predictive.
+
+        total_loss = (
+            loss_ce
+            + self.lambda_ortho * loss_ortho
+            + self.lambda_nem * loss_nem
+            + loss_sar
+        )
+        return logits, total_loss, loss_ce, loss_ortho, loss_nem, loss_sar
+
+    @staticmethod
+    def _class_scores(image_features, text_features):
+        # Text features are (B, ncls, D) in MODE "text" and (ncls, D) otherwise.
+        if text_features.dim() == 3:
+            return torch.einsum("bd,bcd->bc", image_features, text_features)
+        return torch.einsum("bd,cd->bc", image_features, text_features)
+
+    def _encode_text(self, ctx):
+        """Run the text encoder once on the ncls prompts built from `ctx`."""
+        content = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        word_emb = torch.cat([self.prefix, content, self.suffix], dim=1)
+        text_emb = self._get_text_embedding_base(word_emb)
+
+        attention_mask = (self.l_tokenized_prompts != 0).long().to(word_emb.device)
+        extended_attention_mask = self._get_attention_mask(attention_mask)
+        for layer in self.biomedclip_model.text.transformer.encoder.layer:
+            text_emb = layer(text_emb, attention_mask=extended_attention_mask)[0]
+        return self._get_final_text_features(text_emb)
+
+    def _encode_image_keep(self, image, layers=()):
+        """Run the frozen ViT once, keeping the hidden states VGAP reads.
+
+        Returns patch tokens of each layer in `layers` (block output, before
+        trunk.norm), the [CLS] state of the deepest of them, and the projected,
+        unnormalized image feature.
+        """
+        trunk = self.biomedclip_model.visual.trunk
+        hidden, cls_token = {}, None
+        with torch.no_grad():
+            image_emb = trunk.patch_embed(image)
+            image_emb = torch.cat(
+                (trunk.cls_token.expand(image_emb.shape[0], -1, -1), image_emb),
+                dim=1,
+            )
+            image_emb = image_emb + trunk.pos_embed
+            for i, block in enumerate(trunk.blocks):
+                image_emb = block(image_emb)
+                if i in layers:
+                    hidden[i] = image_emb[:, 1:, :]
+                    cls_token = image_emb[:, 0, :]
+            image_features = self._project_image(image_emb)
+        return hidden, cls_token, image_features
 
     def _get_text_embedding_base(self, word_emb):
         ncls, seq_len, _ = word_emb.shape
@@ -329,11 +404,12 @@ class CustomCLIP(nn.Module):
         return text_features_proj / text_features_proj.norm(dim=-1, keepdim=True)
 
     def _get_final_image_features(self, image_emb):
-        image_emb_norm = self.biomedclip_model.visual.trunk.norm(image_emb)
-        image_features_proj = self.biomedclip_model.visual.head.proj(
-            image_emb_norm[:, 0]
-        )
+        image_features_proj = self._project_image(image_emb)
         return image_features_proj / image_features_proj.norm(dim=-1, keepdim=True)
+
+    def _project_image(self, image_emb):
+        image_emb_norm = self.biomedclip_model.visual.trunk.norm(image_emb)
+        return self.biomedclip_model.visual.head.proj(image_emb_norm[:, 0])
 
     def _compute_sar_loss(self, text_features):
         target = self.hand_feas
