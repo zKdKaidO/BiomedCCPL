@@ -2,6 +2,7 @@
 
 **Status:** Proposed (experiment, not yet run)
 **Date:** 2026-10-27
+**Last updated:** 2026-10-28 (VERIFY items resolved against the code at `3257176`, see §6.1)
 **Branch:** `exp/image-side-readout`
 **Scope:** BiomedCCPL on BiomedCLIP (ViT-B/16 image encoder, PubMedBERT text encoder), few-shot medical image classification
 
@@ -16,31 +17,36 @@
    $\mathbf{A} = \text{softmax}_{\text{dim}=1}(\text{MLP}(\mathcal{V}))$, $\mathbf{P} = \mathbf{A}^\top \mathcal{V}$.
 3. For each class $c$, the text-branch [CLS] state $t_c$ queries the prototypes via cross-attention, and the answer is mixed back into the text state:
    $t_c \leftarrow \alpha\, t_c + (1-\alpha)\,\text{CrossAttn}(t_c, \mathbf{P}_l(x))$.
-   This is done separately for the causal and the non-causal (SCD) text branches, with separate cross-attention modules (6 modules total).
+   This is done separately for the causal and the non-causal (SCD) text branches, with separate cross-attention modules (6 modules total). $\alpha$ is set per dataset and protocol (`TRAINER.BIOMEDCCPL.ALPHA`, from 0.1 to 0.9 across the configs).
 4. Logits: $s_c(x) = \tau \cdot \langle \text{norm}(F_I(x)),\ \text{norm}(F_{T,c}(x)) \rangle$.
+5. Loss: $\mathcal{L} = \mathcal{L}_{CE} + \lambda_{Ort}\,\mathcal{L}_{Ort} + \lambda_{NEM}\,\mathcal{L}_{NEM} + \mathcal{L}_{SAR}$. $\mathcal{L}_{SAR}$ pulls the causal text features toward hand-crafted prompt anchors and has no weight in the code. **Note:** the paper defines $\mathcal{L}_{SAR} = 1 - \frac{1}{C}\text{Tr}(F_{T_c} F_{T_h}^\top)$, but the code computes `F.mse_loss` between L2-normalized features, averaged over all $C \times D$ elements. Since $\|a - b\|^2 = 2 - 2\cos$ for unit vectors, $\mathcal{L}_{SAR}^{code} = \frac{2}{D}\,\mathcal{L}_{SAR}^{paper}$, i.e. $\frac{1}{256}\mathcal{L}_{SAR}^{paper}$ at $D = 512$. The gradient points the same way, but the effective weight is $2/D$, not 1. This applies equally to every run in this ADR, so it does not affect the comparison; it matters only when comparing against the paper's formula.
 
 ### 1.2 The problem
 
-The last VGAP injection (layer 11) runs **after** the last text-transformer layer, so the class embedding is approximately
+The last VGAP injection (layer 11) runs **after** the last text-transformer layer, so, up to the final normalization, the class embedding is
 
 $$
-F_{T,c}(x) \approx \text{proj}\big(\alpha\, t_c + (1-\alpha)\,\text{CrossAttn}(t_c,\ \mathbf{P}_{11}(x))\big)
+F_{T,c}(x) = \text{proj}\big(\alpha\, t_c + (1-\alpha)\,\text{CrossAttn}(t_c,\ \mathbf{P}_{11}(x))\big)
 $$
 
-With the typical $\alpha \le 0.4$ (some configs use $\alpha = 0.1$), most of the "text" embedding is a learned summary **of the same image it is compared against**. Ignoring normalization, the logit splits into two terms:
+In 44 of the 65 configs $\alpha \le 0.4$ (15 use $\alpha = 0.1$), so for most settings the larger share of the input to the projection is a learned summary **of the same image it is compared against**. The range is wide, though (0.1 to 0.9), and at $\alpha = 0.9$ the class text dominates, so any analysis should be broken down by $\alpha$.
+
+If $\text{proj}$ were linear, the logit would split into two terms (ignoring normalization):
 
 $$
 s_c(x) \propto \underbrace{\alpha\,\langle F_I,\ \text{proj}(t_c)\rangle}_{\text{image vs. class text}} \;+\; \underbrace{(1-\alpha)\,\langle F_I,\ \text{proj}(\text{CrossAttn}(t_c, \mathbf{P}_{11}(x)))\rangle}_{\text{image vs. a class-specific summary of itself}}
 $$
 
-So the trainable "image readout" lives on the text side of the comparison. Two consequences:
+**It is not linear.** BiomedCLIP's text projection is a two-layer MLP with GELU (`hf_proj_type: "mlp"` in its open_clip config); the image projection is linear. The split above is therefore only a first-order intuition, not an identity, and Phase 0 (§5) measures the image share with ablations, not by splitting terms.
+
+Either way, the trainable "image readout" lives on the text side of the comparison. Two consequences:
 
 - **Cost.** Text features depend on the image, so the text encoder must run $B \times C$ times per step (×2 for causal + non-causal), instead of $C$ times as in CoOp. This is likely why the configs use batch size 1 (our guess; the paper does not say). At test time, text features cannot be cached either: every test image needs $C \times 2$ text forwards.
 - **Interpretability.** We do not know whether VGAP's gain (+~10 pts at 16-shot, Table 2 of the paper) comes from (a) having a learned readout of the prototypes at all, or (b) each class reading the image in its own way (class-conditioned readout). The paper never separates these.
 
 ### 1.3 Why moving the readout is not a trivial rewrite
 
-Note a structural point the coder should understand: if the text-side readout at layer 11 were made class-agnostic (same output $r(x)$ for every class), then the second logit term becomes $\langle F_I, \text{proj}(r(x))\rangle$, which is (up to normalization) **the same for every class** and cannot change the argmax. In other words, on the text side, the final-layer readout only helps *because* it is class-conditioned. On the image side, a class-agnostic readout does change the ranking, because it changes $F_I$ and therefore $\langle F_I', \text{proj}(t_c)\rangle$ differs per class. The image-side design is therefore a genuinely different model, not an equivalent refactor. That is what makes the comparison informative.
+Note a structural point the coder should understand: if the text-side readout at layer 11 were made class-agnostic (same output $r(x)$ for every class), then with a linear projection the second logit term would become $\langle F_I, \text{proj}(r(x))\rangle$, which is (up to normalization) **the same for every class** and cannot change the argmax. In other words, on the text side, the final-layer readout helps mainly *because* it is class-conditioned. Because the real projection is an MLP (§1.2), a shared $r(x)$ still interacts with each $t_c$ through the nonlinearity and the normalization, so this is an approximation: the class-agnostic text-side effect at layer 11 should be small, not exactly zero. On the image side, a class-agnostic readout does change the ranking, because it changes $F_I$ and therefore $\langle F_I', \text{proj}(t_c)\rangle$ differs per class. The image-side design is therefore a genuinely different model, not an equivalent refactor. That is what makes the comparison informative.
 
 ---
 
@@ -82,7 +88,7 @@ Decide these thresholds **before** running anything, and do not change them afte
 
 Implement, on branch `exp/image-side-readout`, a variant of BiomedCCPL in which:
 
-1. **Text side:** VGAP injections are removed from both the causal and the non-causal text branches. The learnable prompts (whatever the repo uses: shallow or deep context tokens) stay exactly as they are. SCD losses ($\mathcal{L}_{NEM}$, $\mathcal{L}_{Ort}$, and any others) stay on and are computed on the now image-independent text features.
+1. **Text side:** VGAP injections are removed from both the causal and the non-causal text branches. The learnable prompts (shallow: 4 context tokens per branch, `ctx_causal` / `ctx_non_causal`) stay exactly as they are. The SCD losses ($\mathcal{L}_{Ort}$, $\mathcal{L}_{NEM}$) and $\mathcal{L}_{SAR}$ stay on, with the same weights and the same code, and are computed on the now image-independent text features.
 2. **Image side:** one prototype readout module is added after the frozen ViT:
 
 $$
@@ -129,7 +135,7 @@ Same as B, but K/V are the 42 prototypes from layers 3, 7, 11 concatenated, each
 
 ### Option D: Class-agnostic readout kept on the text side (R4, diagnostic only)
 
-Original architecture, but the cross-attention query is a **single shared learnable vector** (768-d, one per injection layer and branch) instead of $t_c$. Same cost as R0. Holds placement and multi-layer injection fixed, removes only class conditioning. Not a candidate method; it exists to attribute the result. (Per §1.3, at layer 11 this readout cannot change rankings; the effect can only come through layers 3 and 7.)
+Original architecture, but the cross-attention query is a **single shared learnable vector** (768-d, one per injection layer and branch) instead of $t_c$. Same cost as R0. Holds placement and multi-layer injection fixed, removes only class conditioning. Not a candidate method; it exists to attribute the result. (Per §1.3, at layer 11 this readout can change rankings only through the MLP projection's nonlinearity and the normalization; most of its effect should come through layers 3 and 7.)
 
 ---
 
@@ -137,9 +143,12 @@ Original architecture, but the cross-attention query is a **single shared learna
 
 Run on R0 checkpoints (BTMRI, K = 16, 3 seeds is enough). Expected effort: a few hours.
 
-1. **Logit decomposition.** For each test image and class, compute both terms of the logit split in §1.2 (before normalization; also report the normalized version by computing cosine with only the $t_c$ part vs. full $F_{T,c}$). Report, per layer-11 configuration $\alpha$:
-   - mean |term 2| / (|term 1| + |term 2|);
-   - accuracy using term 1 only vs. full logits.
+1. **Image share of the logit (ablation).** The text projection is an MLP, so the two-term split in §1.2 cannot be computed exactly. Instead, for each test image and class, compute the logit three ways:
+   - (a) full: the model as trained;
+   - (b) text only at layer 11: set the layer-11 cross-attention contribution to zero, i.e. use $\text{proj}(\alpha\, t_c)$ (keep layers 3 and 7 as trained);
+   - (c) text only, unscaled: $\text{proj}(t_c)$, to separate the effect of removing the readout from the effect of shrinking $t_c$ by $\alpha$ before a nonlinear projection.
+
+   Report, for each config's $\alpha$: accuracy of (a), (b), (c), and the mean relative logit change $|s^{(a)} - s^{(b)}| / |s^{(a)}|$. BTMRI uses $\alpha = 0.3$ (few-shot) and $0.4$ (base-to-novel); add one high-$\alpha$ dataset (e.g. RETINA or CHMNIST base-to-novel, $\alpha = 0.9$) as a contrast.
 2. **Class-specificity of the readout.** For each of the 6 cross-attention modules, take the attention weights over the 14 prototypes (average over heads), shape [C, 14] per image. Report the mean pairwise Jensen–Shannon divergence between classes, averaged over test images. Near 0 means every class reads the same prototypes.
 3. **Class-average swap test.** At inference only, replace each class's cross-attention output by the mean over classes (per image, per layer, per branch), keep everything else. Report the accuracy drop. This is the cheapest direct test of P5.
 
@@ -149,27 +158,35 @@ Save numbers to `results/phase0/<dataset>_k<K>_seed<s>.json`. If (3) costs > 3 p
 
 ## 6. Implementation instructions
 
-> The repo structure is not reproduced here. Items marked **VERIFY** must be checked in the code before implementing. Do not guess them.
+> The **VERIFY** items in the first draft were checked against the code at commit `3257176` and BiomedCLIP's `open_clip_config.json`. The answers are collected in §6.1 and folded into the sections below. Line numbers refer to `trainers/biomedccpl.py` at that commit.
 
-### 6.1 Locate the relevant code (VERIFY)
+### 6.1 Code locations (resolved)
 
-Search the repo for:
-- the prototype MLP and `softmax(dim=1)` (VGAP prototype learner);
-- the cross-attention modules and where $\alpha$ is applied (likely a config key such as `ALPHA`);
-- the loop that runs the vision and text transformer blocks in lockstep and injects VGAP at layers 3, 7, 11;
-- where `image_features` and `text_features` are normalized and multiplied by `logit_scale`;
-- where the SCD losses consume causal and non-causal text features;
-- whether "layer 11" is 0-indexed (the last block of ViT-B/16) or 1-indexed. Use **exactly the same layer index and the same pre-/post-LayerNorm hidden state** that the original layer-11 VGAP uses.
+| Item | Where / what |
+|---|---|
+| Prototype learner | Inline `nn.Sequential(Linear(768, 256, bias=False), LayerNorm(256) [fp32], ReLU, Linear(256, 14, bias=False))`, deep-copied once per layer into `self.prototype_learner` (l. 91–102). There is no named class; factor it into a builder function and reuse it in `ImageSideReadout`. Softmax over patches is `F.softmax(w_score, dim=1)` (l. 177) |
+| Cross-attention and $\alpha$ | `nn.MultiheadAttention(768, num_heads=768 // 64 = 12, batch_first=True)`, one `ModuleList` per branch: `crossattention_layer` (causal) and `crossattention_layer_nc` (non-causal) (l. 103–117). $\alpha$ is applied at l. 192–195 and 213–216 |
+| Lockstep loop | `for i in range(12)` (l. 164): text layer $i$ (both branches), then ViT block $i$, then VGAP if `i in self.crosslayers` |
+| Layer index and hidden state | **0-indexed**: `CROSSLAYERS: [3, 7, 11]`, so 11 is the last ViT block. VGAP reads `image_emb[:, 1:, :]`, the **output of block $i$, before `trunk.norm`**. The final norm is applied only in `_get_final_image_features` (l. 305–310). The query for the image-side readout is therefore `image_emb[:, 0, :]` after block 11, before `trunk.norm` |
+| Normalization and logits | `_get_final_text_features` (l. 300–303): CLS → `text.proj` → L2-normalize. `_get_final_image_features`: `trunk.norm` → CLS → `head.proj` → L2-normalize. Logits: `logit_scale.exp() * einsum("bd,bcd->bc")` (l. 231). For the unnormalized $F_I$ that §6.3 needs, add a helper that stops before the division |
+| Projections | Image: linear, 768 → 512 (`timm_proj: "linear"`). Text: **two-layer MLP with GELU** (`hf_proj_type: "mlp"`). $D$ = `embed_dim` = **512** |
+| Text-encoder batching | One call per branch on `B·C` sequences (text states are expanded to `[B·C, L, 768]`, l. 127–131). The non-causal branch runs **only in training** |
+| Test-time branch | **Causal only**: `forward` returns only the causal logits when `not self.training` |
+| Losses (l. 235–263) | `loss_ce`; `loss_ortho = mean((norm(F_Tc) · norm(F_Tnc)^T)^2)` per image, shape `[B, C, C]`; `loss_nem = KL(log_softmax(logits_adv) ‖ uniform)`; `loss_sar = mse(F_Tc, hand_feas)`, see §1.1 item 5. Weights: `LAMBDA_ORTHO`, `LAMBDA_NEM`, SAR unweighted |
+| Trainable parameters | Selected by substring in `names_to_update` (`ctx_causal`, `ctx_non_causal`, `prototype_learner`, `crossattention_layer`; the last also matches `crossattention_layer_nc`). New modules must be added there |
+| Config defaults | `train.py` sets `ALPHA = 1.0`; `CustomCLIP` falls back to `0.01` via `.get()`. Every shipped YAML sets `ALPHA`, so new configs (R4 in particular) must set it explicitly too |
+| Checkpoint loading | `load_model` uses `load_state_dict(strict=False)`, so a checkpoint from another `MODE` would load silently with missing keys. Warn on missing/unexpected keys |
+| Frozen-encoder dropout | dassl puts the whole model in `train()` mode during training, so BERT's dropout in the frozen text encoder is active in R0. Keep it that way in every mode so runs differ only in architecture |
 
 ### 6.2 Config flags
 
-Add (adapt the namespace to the repo's config system; CoOp-family code typically uses Dassl/yacs `cfg.TRAINER.<NAME>`):
+Add under `cfg.TRAINER.BIOMEDCCPL` (registered in `extend_cfg` in `train.py`, dassl/yacs):
 
 ```yaml
 VGAP:
   MODE: "text"            # "text" (R0, original) | "image" (R2/R3) | "none" (R1) | "text_agnostic" (R4)
   IMAGE_LAYERS: [11]      # R2: [11]; R3: [3, 7, 11]
-  READOUT_HEADS: 8        # VERIFY: use the same head count as the original cross-attention
+  READOUT_HEADS: 12       # same head count as the original cross-attention (768 // 64)
   READOUT_DROPOUT: 0.0
   GATE_INIT: 0.0          # g_0; beta = tanh(g)
   READOUT_LR_MULT: 1.0    # LR multiplier for readout params (see 6.7)
@@ -182,7 +199,7 @@ VGAP:
 When `MODE != "text"`, do not run the encoders in lockstep:
 
 1. Run the frozen ViT once per batch, keeping the hidden states of the layers in `IMAGE_LAYERS` plus the final image embedding $F_I$ (projected, **not yet normalized**). Wrap it in `torch.no_grad()`; it receives no gradient.
-2. Run the text encoder once on the $C$ prompts for the causal branch and once for the non-causal branch. Output shapes `[C, D]` each (D = 512, VERIFY the projection dim). No dependency on the image.
+2. Run the text encoder once on the $C$ prompts for the causal branch and once for the non-causal branch. Output shapes `[C, D]` each ($D = 512$). No dependency on the image. At test time only the causal branch is needed (§6.1).
 
 ### 6.4 The readout module
 
@@ -190,13 +207,13 @@ When `MODE != "text"`, do not run the encoders in lockstep:
 class ImageSideReadout(nn.Module):
     """Class-agnostic prototype readout on the image side (ADR-0001)."""
 
-    def __init__(self, width=768, embed_dim=512, n_proto=14, heads=8,
+    def __init__(self, width=768, embed_dim=512, n_proto=14, heads=12,
                  layers=(11,), dropout=0.0, gate_init=0.0):
         super().__init__()
         self.layers = list(layers)
-        # One prototype learner per layer. Reuse the ORIGINAL prototype-MLP class
-        # and its init so prototypes are computed exactly as in VGAP.
-        self.proto = nn.ModuleDict({str(l): OriginalPrototypeMLP(width, n_proto)  # VERIFY class name
+        # One prototype learner per layer. Reuse the ORIGINAL prototype-MLP definition
+        # (factored out of CustomCLIP.__init__, §6.1) so prototypes are computed exactly as in VGAP.
+        self.proto = nn.ModuleDict({str(l): build_prototype_learner(width, n_proto)
                                     for l in self.layers})
         # Layer embedding only needed when mixing several layers (R3).
         self.layer_emb = (nn.Parameter(torch.zeros(len(self.layers), 1, width))
@@ -213,7 +230,8 @@ class ImageSideReadout(nn.Module):
         # f_img:   [B, embed_dim]  projected image feature, NOT normalized
         protos = []
         for i, l in enumerate(self.layers):
-            P = self.proto[str(l)](hidden[l])            # [B, 14, width]
+            A = F.softmax(self.proto[str(l)](hidden[l]), dim=1)   # [B, 196, 14], as original l. 176-177
+            P = A.transpose(1, 2) @ hidden[l]            # [B, 14, width]
             if self.layer_emb is not None:
                 P = P + self.layer_emb[i]
             protos.append(P)
@@ -250,17 +268,23 @@ t_noncausal = F.normalize(text_encoder(prompts_noncausal), dim=-1)
 
 logits_causal = logit_scale * f_img_n @ t_causal.t()           # [B, C]
 logits_noncausal = logit_scale * f_img_n @ t_noncausal.t()
-# Feed these into the SAME loss code the original uses (CE + SCD terms).
-# Any SCD term that used per-image text features of shape [B, C, D] now receives [C, D];
-# broadcast it, or rewrite the term so it is mathematically identical when B == 1. VERIFY each term.
+# Feed these into the SAME loss code the original uses (CE + Ort + NEM + SAR).
+# The original passes text features of shape [B, C, D]; here they are [C, D].
 ```
+
+Checked term by term (§6.1), all three are mathematically identical to the original at $B = 1$ with `[C, D]` text features, and need no rewrite:
+- `loss_ortho`: `[C, C]` instead of `[B, C, C]`; the mean is the same because every image shares the text features.
+- `loss_nem`: uses `logits_noncausal` `[B, C]`, unchanged in form.
+- `loss_sar`: `_compute_sar_loss` already handles 2-D input (it only expands the target when `dim() == 3`).
+
+Also log `loss_sar_cos` $= 1 - \frac{1}{C}\sum_c \cos(F_{T_c}, F_{T_h})$, the paper's form, in every mode. It is detached and logging-only, so the total loss and the `MODE: text` numbers do not change.
 
 - `MODE == "none"` (R1): same, but skip the readout and use `F.normalize(f_img)`.
 - `MODE == "text_agnostic"` (R4): original lockstep code, but in every VGAP cross-attention replace the query $t_c$ with a learnable vector `q_l` of shape `[1, 768]` (one per injection layer and branch, init `normal(std=0.02)`), broadcast to all classes. Keep $\alpha$ and everything else as in R0.
 
 ### 6.6 Inference
 
-For R1/R2/R3, compute `t_causal` and `t_noncausal` **once** per evaluation (and once per class set in base-to-novel), then run images in batches. Use whichever text branch(es) the original uses at test time (VERIFY: causal only, or a combination).
+For R1/R2/R3, compute `t_causal` and `t_noncausal` **once** per evaluation (and once per class set in base-to-novel), then run images in batches. Use the causal branch only, as the original does at test time.
 
 ### 6.7 Training protocol
 
@@ -273,15 +297,16 @@ For R1/R2/R3, compute `t_causal` and `t_noncausal` **once** per evaluation (and 
 
 1. `MODE: "text"` reproduces pre-change outputs exactly (same seed, compare logits on 10 images, `atol=1e-6`).
 2. At init, `MODE: "image"` logits equal `MODE: "none"` logits (`atol=1e-6`).
-3. With a counter or forward hook on the text encoder: per training step, `MODE: "image"` calls it exactly 2 times (causal + non-causal) for batch sizes 1, 4 and 16; `MODE: "text"` calls it $2B$ times (or with $2BC$ sequences, depending on how batching is implemented).
+3. With a forward hook on the first text-encoder layer (`text.transformer.encoder.layer[0]`), count calls and sequences per training step: `MODE: "image"` makes 2 calls with $C$ sequences each, for batch sizes 1, 4 and 16; `MODE: "text"` makes 2 calls with $B \cdot C$ sequences each (§6.1).
 4. No gradient reaches ViT or text-encoder weights (`requires_grad == False`, and `.grad is None` after a step).
 5. After one optimizer step, `readout.g.grad` was nonzero; after two steps, `readout.W_o.weight.grad` is nonzero.
 6. Shapes: prototypes `[B, 14·L, 768]`, readout output `[B, D]`.
 7. A parameter counter prints trainable params per top-level module for each MODE and writes them to the run log.
+8. SAR identity: `loss_sar == (2 / D) * loss_sar_cos` (`atol=1e-6`) in every MODE. This also confirms $D$ at runtime.
 
 ### 6.9 Logging (per epoch, per run)
 
-`beta`, `r_norm_ratio`, entropy of the readout attention over prototypes (mean over images), train/val accuracy, and the trainable-parameter count. Save the readout attention for 20 fixed test images per dataset for later visualization (prototype maps × patch grid).
+`beta`, `r_norm_ratio`, entropy of the readout attention over prototypes (mean over images), `loss_sar_cos` (all modes), train/val accuracy, and the trainable-parameter count. Save the readout attention for 20 fixed test images per dataset for later visualization (prototype maps × patch grid).
 
 ---
 
@@ -342,7 +367,7 @@ Optional, only if R2 ≈ R0: retrain R2 at a larger batch (e.g. B = 16 at K = 16
 **Becomes harder / lost**
 - No class-specific view of the image. Classes that differ only in a small region may suffer, since one readout must serve all classes.
 - No multi-scale injection into the text encoder (partly restored by R3).
-- The SCD story changes: text features are now image-independent, so the causal/non-causal separation applies only to prompts. Check whether any SCD term loses meaning (e.g. if a term compared per-image text features). Document this in the paper.
+- The SCD story changes: text features are now image-independent, so the causal/non-causal separation applies only to prompts. Checked in §6.5: no term loses its mathematical meaning (all are identical at $B = 1$), but $\mathcal{L}_{Ort}$ now constrains prompts, not image-specific text states. Document this in the paper.
 
 **Threats to validity**
 - **Capacity confound:** R2 has ~3M vs ~14.8M trainable params. If R2 loses, it could be capacity rather than conditioning. R4 (same capacity as R0, no conditioning) addresses this.
@@ -354,7 +379,7 @@ Optional, only if R2 ≈ R0: retrain R2 at a larger batch (e.g. B = 16 at K = 16
 
 ## 9. Action items
 
-1. [ ] Locate code points in §6.1 and fill in every **VERIFY** item in this ADR.
+1. [x] Locate code points in §6.1 and fill in every **VERIFY** item in this ADR. (2026-10-28; $D$ and the SAR identity are re-checked at runtime by test 6.8.8.)
 2. [ ] Add config flags; confirm `MODE: text` is bit-identical to the original (test 6.8.1).
 3. [ ] Reproduce R0 on BTMRI K = 16, 3 seeds; compare to the paper.
 4. [ ] Run Phase 0 diagnostics (§5) on those checkpoints.
