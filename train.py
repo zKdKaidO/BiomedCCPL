@@ -50,7 +50,8 @@ def print_configuration(args, cfg):
     print(cfg)
 
 
-def main(args):
+def prepare_trainer(args):
+    """Config, seeding, logging and the Dassl trainer (shared with tools/)."""
     cfg = setup_cfg(args)
     if cfg.SEED >= 0:
         set_random_seed(cfg.SEED)
@@ -63,7 +64,11 @@ def main(args):
 
     print_configuration(args, cfg)
     print(f"System information\n{collect_env_info()}\n")
-    trainer = build_trainer(cfg)
+    return build_trainer(cfg)
+
+
+def main(args):
+    trainer = prepare_trainer(args)
 
     if args.eval_only:
         trainer.load_model(args.model_dir, epoch=args.load_epoch)

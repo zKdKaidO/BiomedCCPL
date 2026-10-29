@@ -1,6 +1,7 @@
 """BiomedCCPL model: VGAP, SCD, and semantic anchor regularization."""
 
 import copy
+import math
 import os.path as osp
 
 import torch
@@ -71,6 +72,12 @@ def warn_on_key_mismatch(load_result, model_path, max_names=5):
                 f"WARNING: {len(keys)} {kind} key(s) when loading '{model_path}': "
                 f"{shown}{more}. Was it trained with a different VGAP.MODE?"
             )
+
+
+def fixed_image_indices(n_items, n_images=20, seed=0):
+    """The same `n_images` test images for every run on a dataset (ADR 6.9)."""
+    generator = torch.Generator().manual_seed(seed)
+    return sorted(torch.randperm(n_items, generator=generator)[:n_images].tolist())
 
 
 class LayerNorm(nn.LayerNorm):
@@ -170,6 +177,27 @@ class ImageSideReadout(nn.Module):
                 "attn_entropy": -(attn * attn.clamp_min(1e-12).log()).sum(-1).mean(),
             }
         return features, logs
+
+    @torch.no_grad()
+    def attention_maps(self, hidden, cls_token):
+        """Maps for visualization: each prototype's softmax over the patch
+        grid, (B, protonum * len(layers), 14, 14), and the readout attention
+        over the prototypes, (B, protonum * len(layers))."""
+        maps = torch.cat(
+            [
+                F.softmax(self.proto[str(layer)](hidden[layer]), dim=1).transpose(1, 2)
+                for layer in self.layers
+            ],
+            dim=1,
+        )
+        side = math.isqrt(maps.shape[-1])
+        kv = self.ln_kv(self.prototypes(hidden))
+        query = self.ln_q(cls_token).unsqueeze(1)
+        _, attn_weights = self.attn(query, kv, kv, need_weights=True)
+        return {
+            "prototype_maps": maps.reshape(maps.shape[0], maps.shape[1], side, side),
+            "readout_attn": attn_weights.squeeze(1),
+        }
 
 
 class CustomCLIP(nn.Module):
@@ -436,6 +464,12 @@ class CustomCLIP(nn.Module):
             )
         else:
             return logits
+
+    @torch.no_grad()
+    def readout_attention(self, image):
+        """MODE "image" only: see ImageSideReadout.attention_maps."""
+        hidden, cls_token, _ = self._encode_image_keep(image, self.image_layers)
+        return self.image_readout.attention_maps(hidden, cls_token)
 
     def _vgap_query(self, name, counter, text_emb_batch):
         """Cross-attention query: the class [CLS] states, or in R4 a shared
@@ -718,6 +752,37 @@ class BIOMEDCCPL_BiomedCLIP(TrainerX):
             self.update_lr()
 
         return loss_summary
+
+    def after_train(self):
+        super().after_train()
+        if self.model.vgap_mode == "image":
+            self.save_readout_attention()
+
+    @torch.no_grad()
+    def save_readout_attention(self, n_images=20, path=None):
+        """Save the readout attention on fixed test images (ADR-0001 6.9)."""
+        dataset = self.test_loader.dataset
+        indices = fixed_image_indices(len(dataset), n_images)
+        items = [dataset[i] for i in indices]
+        image = torch.stack([item["img"] for item in items]).to(self.device)
+
+        self.model.eval()
+        maps = self.model.readout_attention(image)
+        logits = self.model(image)
+        record = {
+            "indices": indices,
+            "impaths": [item["impath"] for item in items],
+            "labels": torch.tensor([item["label"] for item in items]),
+            "preds": logits.argmax(dim=-1).cpu(),
+            "layers": list(self.model.image_layers),
+            "protonum": self.model.protonum,
+            "beta": torch.tanh(self.model.image_readout.g).item(),
+            **{name: value.cpu() for name, value in maps.items()},
+        }
+        path = path or osp.join(self.output_dir, "readout_attention.pt")
+        torch.save(record, path)
+        print(f"Saved readout attention for {len(indices)} test images to {path}")
+        return path
 
     def parse_batch_train(self, batch):
         input = batch["img"]

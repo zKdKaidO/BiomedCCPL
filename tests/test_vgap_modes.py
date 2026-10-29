@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+import types
 
 import pytest
 import torch
@@ -588,3 +589,60 @@ def test_text_mode_is_not_cached(biomedclip, models):
         for seed in range(2):
             text_model(images(2, seed=seed))
     assert sizes == [2 * len(CLASSNAMES)] * 2  # image-conditioned text features
+
+
+# 6.9: readout attention on fixed test images.
+def test_fixed_image_indices():
+    from trainers.biomedccpl import fixed_image_indices
+
+    indices = fixed_image_indices(1000)
+    assert indices == fixed_image_indices(1000) and len(set(indices)) == 20
+    assert indices == sorted(indices) and all(0 <= i < 1000 for i in indices)
+    assert fixed_image_indices(5) == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("layers", [[11], [3, 7, 11]])
+def test_readout_attention_maps(layers):
+    from trainers.biomedccpl import ImageSideReadout
+
+    readout = ImageSideReadout(layers)
+    hidden = {layer: torch.randn(2, 196, 768) for layer in layers}
+    cls_token = torch.randn(2, 768)
+    maps = readout.attention_maps(hidden, cls_token)
+    n_proto = 14 * len(layers)
+    assert maps["prototype_maps"].shape == (2, n_proto, 14, 14)
+    assert maps["readout_attn"].shape == (2, n_proto)
+    torch.testing.assert_close(
+        maps["prototype_maps"].sum(dim=(-2, -1)), torch.ones(2, n_proto)
+    )
+    torch.testing.assert_close(maps["readout_attn"].sum(-1), torch.ones(2))
+
+    # The same attention the forward pass logs the entropy of.
+    _, logs = readout(hidden, cls_token, torch.randn(2, 512))
+    attn = maps["readout_attn"]
+    entropy = -(attn * attn.log()).sum(-1).mean()
+    torch.testing.assert_close(entropy, logs["attn_entropy"])
+
+
+def test_trainer_saves_readout_attention(tmp_path, r2_models):
+    from trainers.biomedccpl import BIOMEDCCPL_BiomedCLIP
+
+    _, model = r2_models
+    dataset = [
+        {"img": images(1, seed=i)[0], "label": i % 4, "impath": f"img{i}.jpg"}
+        for i in range(25)
+    ]
+    trainer = BIOMEDCCPL_BiomedCLIP.__new__(BIOMEDCCPL_BiomedCLIP)
+    trainer.model = model
+    trainer.test_loader = types.SimpleNamespace(dataset=dataset)
+    trainer.device = torch.device("cpu")
+    trainer.output_dir = str(tmp_path)
+
+    path = trainer.save_readout_attention()
+    record = torch.load(path)
+    assert len(record["indices"]) == len(record["impaths"]) == 20
+    assert record["impaths"] == [f"img{i}.jpg" for i in record["indices"]]
+    assert record["prototype_maps"].shape == (20, 14, 14, 14)
+    assert record["readout_attn"].shape == (20, 14)
+    assert record["preds"].shape == record["labels"].shape == (20,)
+    assert record["layers"] == [11] and record["beta"] == 0.0
