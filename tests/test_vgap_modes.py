@@ -99,7 +99,7 @@ def test_trainable_params_extend_original():
 
     names = biomedccpl.TRAINABLE_PARAM_NAMES
     assert names[: len(ORIGINAL_TRAINABLE)] == ORIGINAL_TRAINABLE
-    assert names[len(ORIGINAL_TRAINABLE) :] == ["image_readout"]
+    assert names[len(ORIGINAL_TRAINABLE) :] == ["image_readout", "vgap_query"]
 
 
 def test_invalid_mode_rejected(biomedclip):
@@ -333,8 +333,68 @@ def test_r3_train_step_runs(biomedclip):
     assert "image_readout.layer_emb" in grads
 
 
+# MODE "text_agnostic" (R4): the original model with a shared query.
+@pytest.fixture(scope="module")
+def r4_models(biomedclip, models):
+    """(MODE "text", MODE "text_agnostic") built from the same seed."""
+    from trainers import biomedccpl
+
+    _, text_model = models
+    agnostic = build(
+        biomedccpl, make_cfg(MODE="text_agnostic"), biomedclip,
+        biomedccpl.TRAINABLE_PARAM_NAMES,
+    )
+    return text_model, agnostic
+
+
+def test_text_agnostic_init_matches_text_mode(r4_models):
+    text_model, agnostic = r4_models
+    text_state, agnostic_state = text_model.state_dict(), agnostic.state_dict()
+    assert set(agnostic_state) - set(text_state) == {"vgap_query", "vgap_query_nc"}
+    for key in text_state:
+        assert torch.equal(text_state[key], agnostic_state[key]), key
+    assert agnostic.vgap_query.shape == (3, 1, 768)
+    assert agnostic.vgap_query.std().item() == pytest.approx(0.02, rel=0.1)
+
+
+@contextlib.contextmanager
+def record_outputs(modules):
+    outputs = []
+    handles = [
+        m.register_forward_hook(lambda m, inp, out: outputs.append(out[0].detach()))
+        for m in modules
+    ]
+    try:
+        yield outputs
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_text_agnostic_readout_is_class_agnostic(r4_models, batch_size):
+    text_model, agnostic = r4_models
+    x, label = images(batch_size), torch.arange(batch_size)
+    for model, agnostic_expected in ((text_model, False), (agnostic, True)):
+        modules = [*model.crossattention_layer, *model.crossattention_layer_nc]
+        with record_outputs(modules) as outputs:
+            train_step(model, x, label)
+        assert len(outputs) == 6
+        for out in outputs:  # B, ncls, 768
+            assert out.shape == (batch_size, len(CLASSNAMES), 768)
+            same = torch.allclose(out, out[:, :1].expand_as(out), atol=1e-6)
+            assert same == agnostic_expected, model.vgap_mode
+
+
+def test_text_agnostic_queries_get_grad(r4_models):
+    _, agnostic = r4_models
+    _, grads = train_step(agnostic, images(1), torch.tensor([0]))
+    assert grads["vgap_query"].abs().max() > 0
+    assert grads["vgap_query_nc"].abs().max() > 0
+
+
 # 6.8.7: trainable parameters per top-level module.
-def test_trainable_param_counts(biomedclip, models, r1_models, r2_models):
+def test_trainable_param_counts(biomedclip, models, r1_models, r2_models, r4_models):
     from trainers import biomedccpl
 
     r3 = build(
@@ -360,13 +420,16 @@ def test_trainable_param_counts(biomedclip, models, r1_models, r2_models):
     assert count(r3) == {
         **prompts, "image_readout": 3 * prototype_learner + 3 * 768 + readout
     }
+    assert count(r4_models[1]) == {
+        **count(models[1]), "vgap_query": 3 * 768, "vgap_query_nc": 3 * 768
+    }
     # The ADR's estimates: ~14.8M (R0) and ~3M (R2).
     assert sum(count(models[1]).values()) == 14_782_464
     assert sum(count(r2_models[1]).values()) == 2_965_505
 
 
 # 6.8.8: the code's SAR (element-wise MSE) is (2 / D) x the paper's form.
-@pytest.mark.parametrize("fixture", ["models", "r1_models", "r2_models"])
+@pytest.mark.parametrize("fixture", ["models", "r1_models", "r2_models", "r4_models"])
 def test_sar_matches_paper_form(request, biomedclip, fixture):
     _, model = request.getfixturevalue(fixture)
     outputs, _ = train_step(model, images(1), torch.tensor([0]))
@@ -377,13 +440,14 @@ def test_sar_matches_paper_form(request, biomedclip, fixture):
     )
 
 
-def test_logs_are_scalars_per_mode(models, r1_models, r2_models):
+def test_logs_are_scalars_per_mode(models, r1_models, r2_models, r4_models):
     expected_keys = {
         "text": {"loss_sar_cos"},
+        "text_agnostic": {"loss_sar_cos"},
         "none": {"loss_sar_cos"},
         "image": {"loss_sar_cos", "beta", "r_norm_ratio", "attn_entropy"},
     }
-    for _, model in (models, r1_models, r2_models):
+    for _, model in (models, r1_models, r2_models, r4_models):
         train_step(model, images(1), torch.tensor([0]))
         assert set(model.logs) == expected_keys[model.vgap_mode]
         assert all(v.dim() == 0 and not v.requires_grad for v in model.logs.values())
@@ -391,13 +455,13 @@ def test_logs_are_scalars_per_mode(models, r1_models, r2_models):
 
 # 6.8.3: text-encoder sequences per training step.
 @pytest.mark.parametrize("batch_size", [1, 4])
-def test_text_mode_sequences_per_step(biomedclip, models, batch_size):
-    _, text_model = models
+def test_text_mode_sequences_per_step(biomedclip, r4_models, batch_size):
     n_cls = len(CLASSNAMES)
     x = images(batch_size)
-    with count_text_sequences(biomedclip) as sizes:
-        train_step(text_model, x, torch.arange(batch_size) % n_cls)
-    assert sizes == [batch_size * n_cls, batch_size * n_cls]
+    for model in r4_models:  # MODE "text" and "text_agnostic": same cost
+        with count_text_sequences(biomedclip) as sizes:
+            train_step(model, x, torch.arange(batch_size) % n_cls)
+        assert sizes == [batch_size * n_cls, batch_size * n_cls], model.vgap_mode
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
@@ -411,7 +475,7 @@ def test_decoupled_sequences_per_step(biomedclip, r2_models, batch_size):
 
 
 # 6.8.4: no gradient reaches the frozen encoders.
-@pytest.mark.parametrize("fixture", ["models", "r1_models", "r2_models"])
+@pytest.mark.parametrize("fixture", ["models", "r1_models", "r2_models", "r4_models"])
 def test_frozen_encoders_get_no_grad(request, biomedclip, fixture):
     _, model = request.getfixturevalue(fixture)
     train_step(model, images(1), torch.tensor([0]))
@@ -421,11 +485,14 @@ def test_frozen_encoders_get_no_grad(request, biomedclip, fixture):
 
 
 # READOUT_LR_MULT: the readout gets its own optimizer group (ADR 6.7).
-def test_param_groups_only_split_off_the_readout(models, r1_models, r2_models):
+def test_param_groups_only_split_off_the_readout(
+    models, r1_models, r2_models, r4_models
+):
     from trainers.biomedccpl import build_param_groups
 
     assert build_param_groups(models[1], 0.0025, 10.0) is None  # R0: unchanged
     assert build_param_groups(r1_models[1], 0.0025, 10.0) is None
+    assert build_param_groups(r4_models[1], 0.0025, 10.0) is None
 
     model = r2_models[1]
     others, readout = build_param_groups(model, 0.0025, 10.0)

@@ -23,6 +23,7 @@ TRAINABLE_PARAM_NAMES = [
     "prototype_learner",
     "crossattention_layer",
     "image_readout",
+    "vgap_query",
 ]
 
 
@@ -195,10 +196,6 @@ class CustomCLIP(nn.Module):
             raise ValueError(
                 f"VGAP.MODE must be one of {VGAP_MODES}, got {self.vgap_mode!r}"
             )
-        if self.vgap_mode == "text_agnostic":
-            raise NotImplementedError(
-                f"VGAP.MODE {self.vgap_mode!r} is not implemented yet (ADR-0001)"
-            )
         self.image_layers = sorted(vgap_cfg.get("IMAGE_LAYERS", [11]))
         n_blocks = len(biomedclip_model.visual.trunk.blocks)
         if self.vgap_mode == "image" and (
@@ -258,8 +255,14 @@ class CustomCLIP(nn.Module):
 
         # Text-side VGAP modules; built after the prompts so that every MODE
         # starts from the same prompt initialization for a given seed.
-        if self.vgap_mode == "text":
+        if self.vgap_mode in ("text", "text_agnostic"):
             self._build_text_vgap()
+        if self.vgap_mode == "text_agnostic":
+            # R4: one shared query per injection layer and branch replaces the
+            # class [CLS] token, so every class reads the prototypes the same way.
+            n_layers = len(self.crosslayers)
+            self.vgap_query = nn.Parameter(torch.randn(n_layers, 1, 768) * 0.02)
+            self.vgap_query_nc = nn.Parameter(torch.randn(n_layers, 1, 768) * 0.02)
         elif self.vgap_mode == "image":
             self.image_readout = ImageSideReadout(
                 self.image_layers,
@@ -297,12 +300,15 @@ class CustomCLIP(nn.Module):
 
     def forward(self, image, label=None):
         self.logs = {}
-        if self.vgap_mode == "text":
+        if self.vgap_mode in ("text", "text_agnostic"):
             return self._forward_text_vgap(image, label)
         return self._forward_decoupled(image, label)
 
     def _forward_text_vgap(self, image, label=None):
-        """Original BiomedCCPL forward: VGAP injected into both text branches."""
+        """Original BiomedCCPL forward: VGAP injected into both text branches.
+
+        MODE "text_agnostic" (R4) differs only in the cross-attention query.
+        """
         logit_scale = self.logit_scale.exp()
         batch_size = image.shape[0]
 
@@ -368,7 +374,9 @@ class CustomCLIP(nn.Module):
                 )
 
                 crossatt_out_c, _ = self.crossattention_layer[counter](
-                    query=text_emb_causal_batch[:, :, 0, :],  # (B, ncls, 768)
+                    query=self._vgap_query(
+                        "vgap_query", counter, text_emb_causal_batch
+                    ),  # (B, ncls, 768)
                     key=prototype,  # (B, protonum, 768)
                     value=prototype,
                 )
@@ -389,7 +397,9 @@ class CustomCLIP(nn.Module):
                         batch_size, self.n_cls, seq_len, -1
                     )
                     crossatt_out_u, _ = self.crossattention_layer_nc[counter](
-                        query=text_emb_non_causal_batch[:, :, 0, :],
+                        query=self._vgap_query(
+                            "vgap_query_nc", counter, text_emb_non_causal_batch
+                        ),
                         key=prototype,
                         value=prototype,
                     )
@@ -424,6 +434,14 @@ class CustomCLIP(nn.Module):
             )
         else:
             return logits
+
+    def _vgap_query(self, name, counter, text_emb_batch):
+        """Cross-attention query: the class [CLS] states, or in R4 a shared
+        learned vector broadcast to every class."""
+        if self.vgap_mode == "text":
+            return text_emb_batch[:, :, 0, :]
+        batch_size, n_cls = text_emb_batch.shape[:2]
+        return getattr(self, name)[counter].expand(batch_size, n_cls, -1)
 
     def _forward_decoupled(self, image, label=None):
         """VGAP.MODE "none" (R1) and "image" (R2/R3).

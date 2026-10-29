@@ -144,6 +144,7 @@ VGAP_MODE=image RUN_TAG=r3 bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0
   TRAINER.BIOMEDCCPL.VGAP.IMAGE_LAYERS "[3, 7, 11]"                       # R3
 VGAP_MODE=image RUN_TAG=r2_lr10 bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0 \
   TRAINER.BIOMEDCCPL.VGAP.READOUT_LR_MULT 10.0                            # R2, readout at 10x LR
+VGAP_MODE=text_agnostic bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0  # R4: shared VGAP query
 ```
 
 Set a distinct `RUN_TAG` whenever two runs share a mode, or the second overwrites the first. `run_base_to_novel.sh` works the same way and applies the mode and overrides to both the base training and the novel evaluation.

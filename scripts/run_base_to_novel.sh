@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# VGAP_MODE selects the ADR-0001 variant (text = original BiomedCCPL, none, image).
+# VGAP_MODE selects the ADR-0001 variant (text = original BiomedCCPL, none,
+# image, text_agnostic).
 # RUN_TAG names the output folder; set it when two runs share a mode (e.g. R2 vs R3).
 # Extra arguments after GPU_ID are passed to train.py as config overrides, for
 # both the base training run and the novel evaluation.
 if [[ $# -lt 2 ]]; then
-  echo "Usage: [VGAP_MODE=text|none|image] [RUN_TAG=name] $0 DATA_ROOT DATASET [GPU_ID [KEY VALUE ...]]" >&2
+  echo "Usage: [VGAP_MODE=text|none|image|text_agnostic] [RUN_TAG=name] $0 DATA_ROOT DATASET [GPU_ID [KEY VALUE ...]]" >&2
   exit 2
 fi
 
