@@ -80,6 +80,42 @@ def fixed_image_indices(n_items, n_images=20, seed=0):
     return sorted(torch.randperm(n_items, generator=generator)[:n_images].tolist())
 
 
+class VGAPProbe:
+    """Inference-only interventions on the text-side VGAP (ADR-0001 Phase 0).
+
+    Set `CustomCLIP.vgap_probe` to an instance; `None` (the default) leaves the
+    forward pass untouched. At the ViT layers in `layers`, `intervention`
+    replaces the class feature alpha * t_c + (1 - alpha) * CrossAttn(t_c, P):
+      "text_only_alpha"  alpha * t_c       (readout contribution removed)
+      "text_only"        t_c               (removed and not scaled by alpha)
+      "class_mean"       the readout averaged over classes, per image
+    Every module's attention over the prototypes, (B, ncls, protonum), is
+    stored in `attn` under (branch, layer). `non_causal` also runs the
+    non-causal branch at test time so its attention can be recorded.
+    """
+
+    INTERVENTIONS = (None, "text_only_alpha", "text_only", "class_mean")
+
+    def __init__(self, intervention=None, layers=(), non_causal=False):
+        if intervention not in self.INTERVENTIONS:
+            raise ValueError(f"intervention must be one of {self.INTERVENTIONS}")
+        self.intervention = intervention
+        self.layers = set(layers)
+        self.non_causal = non_causal
+        self.attn = {}
+
+    def mix(self, branch, layer, alpha, cls_feature, readout, attn):
+        self.attn[(branch, layer)] = attn.detach()
+        if self.intervention is None or layer not in self.layers:
+            return alpha * cls_feature + (1 - alpha) * readout
+        if self.intervention == "text_only_alpha":
+            return alpha * cls_feature
+        if self.intervention == "text_only":
+            return cls_feature
+        readout = readout.mean(dim=1, keepdim=True).expand_as(readout)
+        return alpha * cls_feature + (1 - alpha) * readout
+
+
 class LayerNorm(nn.LayerNorm):
     """Compute LayerNorm in fp32 for stable mixed-precision training."""
 
@@ -238,6 +274,8 @@ class CustomCLIP(nn.Module):
         self.logs = {}
         # Test-time causal text features of the decoupled modes (ADR-0001 6.6).
         self._text_cache = None
+        # Phase 0 diagnostics only; see VGAPProbe.
+        self.vgap_probe = None
 
         clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
@@ -341,6 +379,8 @@ class CustomCLIP(nn.Module):
         """
         logit_scale = self.logit_scale.exp()
         batch_size = image.shape[0]
+        probe = self.vgap_probe
+        run_non_causal = self.training or (probe is not None and probe.non_causal)
 
         content_causal = self.ctx_causal.unsqueeze(0).expand(self.n_cls, -1, -1)
         word_emb_causal = torch.cat([self.prefix, content_causal, self.suffix], dim=1)
@@ -352,7 +392,7 @@ class CustomCLIP(nn.Module):
             .reshape(batch_size * self.n_cls, seq_len, -1)
         )
 
-        if self.training:
+        if run_non_causal:
             content_non_causal = self.ctx_non_causal.unsqueeze(0).expand(
                 self.n_cls, -1, -1
             )
@@ -387,7 +427,7 @@ class CustomCLIP(nn.Module):
             text_emb_causal = self.biomedclip_model.text.transformer.encoder.layer[i](
                 text_emb_causal, attention_mask=extended_attention_mask
             )[0]
-            if self.training:
+            if run_non_causal:
                 text_emb_non_causal = (
                     self.biomedclip_model.text.transformer.encoder.layer[i](
                         text_emb_non_causal, attention_mask=extended_attention_mask
@@ -403,17 +443,23 @@ class CustomCLIP(nn.Module):
                     batch_size, self.n_cls, seq_len, -1
                 )
 
-                crossatt_out_c, _ = self.crossattention_layer[counter](
+                crossatt_out_c, attn_c = self.crossattention_layer[counter](
                     query=self._vgap_query(
                         "vgap_query", counter, text_emb_causal_batch
                     ),  # (B, ncls, 768)
                     key=prototype,  # (B, protonum, 768)
                     value=prototype,
                 )
-                cau_class_feature = (
-                    self.alpha * text_emb_causal_batch[:, :, 0, :]
-                    + (1 - self.alpha) * crossatt_out_c
-                )
+                if probe is None:
+                    cau_class_feature = (
+                        self.alpha * text_emb_causal_batch[:, :, 0, :]
+                        + (1 - self.alpha) * crossatt_out_c
+                    )
+                else:
+                    cau_class_feature = probe.mix(
+                        "causal", i, self.alpha,
+                        text_emb_causal_batch[:, :, 0, :], crossatt_out_c, attn_c,
+                    )
                 text_emb_causal = torch.cat(
                     [
                         cau_class_feature.unsqueeze(2),
@@ -422,21 +468,28 @@ class CustomCLIP(nn.Module):
                     dim=2,
                 ).reshape(batch_size * self.n_cls, seq_len, -1)
 
-                if self.training:
+                if run_non_causal:
                     text_emb_non_causal_batch = text_emb_non_causal.reshape(
                         batch_size, self.n_cls, seq_len, -1
                     )
-                    crossatt_out_u, _ = self.crossattention_layer_nc[counter](
+                    crossatt_out_u, attn_u = self.crossattention_layer_nc[counter](
                         query=self._vgap_query(
                             "vgap_query_nc", counter, text_emb_non_causal_batch
                         ),
                         key=prototype,
                         value=prototype,
                     )
-                    adv_class_feature = (
-                        self.alpha * text_emb_non_causal_batch[:, :, 0, :]
-                        + (1 - self.alpha) * crossatt_out_u
-                    )
+                    if probe is None:
+                        adv_class_feature = (
+                            self.alpha * text_emb_non_causal_batch[:, :, 0, :]
+                            + (1 - self.alpha) * crossatt_out_u
+                        )
+                    else:
+                        adv_class_feature = probe.mix(
+                            "non_causal", i, self.alpha,
+                            text_emb_non_causal_batch[:, :, 0, :], crossatt_out_u,
+                            attn_u,
+                        )
                     text_emb_non_causal = torch.cat(
                         [
                             adv_class_feature.unsqueeze(2),
