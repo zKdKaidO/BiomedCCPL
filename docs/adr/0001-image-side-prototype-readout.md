@@ -381,10 +381,10 @@ Optional, only if R2 ≈ R0: retrain R2 at a larger batch (e.g. B = 16 at K = 16
 ## 9. Action items
 
 1. [x] Locate code points in §6.1 and fill in every **VERIFY** item in this ADR. (2026-10-28; $D$ and the SAR identity are re-checked at runtime by test 6.8.8.)
-2. [ ] Add config flags; confirm `MODE: text` is bit-identical to the original (test 6.8.1).
+2. [x] Add config flags; confirm `MODE: text` is bit-identical to the original (test 6.8.1).
 3. [ ] Reproduce R0 on BTMRI K = 16, 3 seeds; compare to the paper.
 4. [ ] Run Phase 0 diagnostics (§5) on those checkpoints.
-5. [ ] Implement `ImageSideReadout`, decoupled forward, `MODE: none` / `image`; pass all tests in §6.8.
+5. [x] Implement `ImageSideReadout`, decoupled forward, `MODE: none` / `image`; pass all tests in §6.8. (`MODE: text_agnostic`, test-time text caching (§6.6), the Phase 0 tool (`tools/phase0_diagnostics.py`), the cost benchmark (`tools/benchmark_cost.py`) and the readout-attention dump (§6.9) are implemented and tested too; no run has been trained yet.)
 6. [ ] Run R0, R1, R2 on the full grid (§7.2).
 7. [ ] Run the cost benchmark (§7.3).
 8. [ ] Depending on the outcome (§2.4), run R3 and/or R4.

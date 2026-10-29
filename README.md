@@ -33,7 +33,7 @@ BiomedCCPL/
 ├── configs/                  # Dataset- and shot-specific hyperparameters
 ├── datasets/                 # Unified loader for 11 biomedical datasets
 ├── scripts/                  # Reproduction scripts
-├── tools/                    # Result aggregation
+├── tools/                    # Result aggregation and ADR-0001 diagnostics
 ├── trainers/biomedccpl.py    # VGAP, SCD, and the trainer
 ├── train.py                  # Training/evaluation entry point
 └── requirements.txt
@@ -148,6 +148,28 @@ VGAP_MODE=text_agnostic bash scripts/run_few_shot.sh /path/to/data BTMRI 16 0  #
 ```
 
 Set a distinct `RUN_TAG` whenever two runs share a mode, or the second overwrites the first. `run_base_to_novel.sh` works the same way and applies the mode and overrides to both the base training and the novel evaluation.
+
+In `MODE image` each training run also writes `readout_attention.pt` to its output folder: the prototype maps (14×14 patch grid) and readout attention for 20 fixed test images, with labels, predictions and the final gate β. Outside `MODE text`/`text_agnostic`, evaluation encodes the class prompts once and reuses them for every batch.
+
+Diagnostics and cost tools (inference or synthetic inputs only):
+
+```bash
+# Phase 0 (ADR §5) on a trained R0 checkpoint -> results/phase0/BTMRI_k16_seed1.json
+python tools/phase0_diagnostics.py --root /path/to/data --seed 1 \
+  --config-file configs/trainers/BiomedCCPL/few_shot/16/BTMRI.yaml \
+  --model-dir output/few_shot/text/BTMRI/16shot/seed1 --load-epoch 50 \
+  DATASET.NAME BTMRI DATASET.NUM_SHOTS 16
+
+# Re-create readout_attention.pt from an R2/R3 checkpoint
+python tools/save_readout_attention.py --root /path/to/data --seed 1 \
+  --output-dir output/attention/BTMRI/seed1 \
+  --config-file configs/trainers/BiomedCCPL/few_shot/16/BTMRI.yaml \
+  --model-dir output/few_shot/image/BTMRI/16shot/seed1 --load-epoch 50 \
+  DATASET.NAME BTMRI DATASET.NUM_SHOTS 16 TRAINER.BIOMEDCCPL.VGAP.MODE image
+
+# Cost benchmark (ADR §7.3) on synthetic BTMRI-sized batches -> results/cost/BTMRI_cuda.json
+python tools/benchmark_cost.py --device cuda --modes text image --batch-sizes 1 8 32
+```
 
 ### Single run
 
