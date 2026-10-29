@@ -208,6 +208,8 @@ class CustomCLIP(nn.Module):
             )
         # Detached diagnostics from the last forward pass, logged by the trainer.
         self.logs = {}
+        # Test-time causal text features of the decoupled modes (ADR-0001 6.6).
+        self._text_cache = None
 
         clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
@@ -465,7 +467,7 @@ class CustomCLIP(nn.Module):
                 dim=-1, keepdim=True
             )
 
-        cau_text_feature = self._encode_text(self.ctx_causal)  # (ncls, D)
+        cau_text_feature = self._causal_text_features()  # (ncls, D)
         logits = logit_scale * self._class_scores(image_features, cau_text_feature)
 
         if self.training:
@@ -475,6 +477,24 @@ class CustomCLIP(nn.Module):
             )
         else:
             return logits
+
+    def _causal_text_features(self):
+        """Causal text features; at test time computed once and reused.
+
+        They do not depend on the image outside MODE "text"/"text_agnostic",
+        so evaluation encodes the prompts once instead of once per batch. The
+        cache is keyed on the prompt tensor and its in-place version counter,
+        so optimizer steps and load_state_dict invalidate it.
+        """
+        if self.training:
+            self._text_cache = None
+            return self._encode_text(self.ctx_causal)
+        ctx = self.ctx_causal
+        key = (ctx.data_ptr(), ctx._version, ctx.device, ctx.dtype)
+        if self._text_cache is None or self._text_cache[0] != key:
+            with torch.no_grad():
+                self._text_cache = (key, self._encode_text(ctx))
+        return self._text_cache[1]
 
     def _compute_losses(
         self, logits, label, image_features, cau_text_feature, adv_text_features

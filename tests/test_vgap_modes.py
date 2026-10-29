@@ -543,3 +543,48 @@ def test_key_mismatch_warning(capsys):
     out = capsys.readouterr().out
     assert "7 missing key(s)" in out and "(+2 more)" in out
     assert "1 unexpected key(s)" in out
+
+
+# 6.6: decoupled modes encode the prompts once per evaluation.
+def test_eval_text_features_cached(biomedclip, r2_models):
+    n_cls = len(CLASSNAMES)
+    for model in r2_models:  # MODE "none" and "image"
+        model.eval()
+        model._text_cache = None
+        batches = [images(3, seed=s) for s in range(3)]
+        with torch.no_grad():
+            with count_text_sequences(biomedclip) as sizes:
+                cached = [model(x) for x in batches]
+            assert sizes == [n_cls], model.vgap_mode
+            fresh_text = model._encode_text(model.ctx_causal)
+            torch.testing.assert_close(
+                model._text_cache[1], fresh_text, rtol=0, atol=0
+            )
+
+            # In-place prompt changes (optimizer step, load_state_dict) invalidate it.
+            state = {k: v.clone() for k, v in model.state_dict().items()}
+            # (a constant shift would be undone by the embedding LayerNorm)
+            generator = torch.Generator().manual_seed(0)
+            noise = torch.randn(model.ctx_causal.shape, generator=generator)
+            model.ctx_causal.add_(0.1 * noise)
+            with count_text_sequences(biomedclip) as sizes:
+                changed = model(batches[0])
+            assert sizes == [n_cls]
+            assert not torch.allclose(changed, cached[0])
+            model.load_state_dict(state)
+            with count_text_sequences(biomedclip) as sizes:
+                restored = model(batches[0])
+            assert sizes == [n_cls]
+            torch.testing.assert_close(restored, cached[0], rtol=0, atol=0)
+
+        train_step(model, images(1), torch.tensor([0]))
+        assert model._text_cache is None
+
+
+def test_text_mode_is_not_cached(biomedclip, models):
+    _, text_model = models
+    text_model.eval()
+    with torch.no_grad(), count_text_sequences(biomedclip) as sizes:
+        for seed in range(2):
+            text_model(images(2, seed=seed))
+    assert sizes == [2 * len(CLASSNAMES)] * 2  # image-conditioned text features
